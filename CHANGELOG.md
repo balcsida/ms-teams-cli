@@ -5,15 +5,25 @@
 ### Added
 
 - `--redirect-uri`, `TEAMS_CLI_REDIRECT_URI` and the profile's `redirect_uri` select the browser login's redirect URI for `auth login`, `auth consent-url` and `auth doctor`. The login listens on the URI's host and port (both loopback addresses for `localhost`) for a request to the URI's path carrying the login's `state`; the flag is saved to the profile with the IDs. A redirect URI without a port gets a free port from the OS at each login, as MSAL does; the identity platform allows this because it ignores the port of a localhost redirect URI, so `--redirect-uri http://localhost` works for an app registered that way.
+- `teams subscribe create --lifecycle-url URL` sets the subscription's `lifecycleNotificationUrl`, which Graph requires for Teams subscriptions longer than one hour. Graph validates that URL too, so `teams listen` answers validation and notifications on `/lifecycle` as well as `/` and `/webhook`, and one tunnel serves both.
+- `teams listen --client-state SECRET` (or `TEAMS_CLI_CLIENT_STATE`) drops notifications whose `clientState` is missing or different, with a warning on stderr that does not include either value. Without it, the listener warns at startup that notifications are not authenticated.
+- `teams listen --bind ADDR` chooses the listening address, and `--port 0` picks a free port; the startup line names the address actually bound.
+- Each `teams listen` line now carries every field Graph sent (`subscriptionExpirationDateTime`, `lifecycleEvent`, `encryptedContent` and so on) and `kind`: `lifecycle` when `lifecycleEvent` is present, else `change`. The README's "Running behind a relay" says what a relay should POST and which statuses to retry.
 
 ### Changed
 
+- **`teams listen` binds `127.0.0.1` by default instead of `0.0.0.0`.** Pass `--bind 0.0.0.0` to accept connections from other hosts.
+- `teams listen` answers notifications with 202 once they are queued for stdout, instead of 200 after printing, so a slow stdout reader no longer holds the HTTP response; when the queue (8 MiB) is full it answers 503 so the sender retries. Validation requests are answered whatever the queue state. On Ctrl+C or SIGTERM it stops admitting notifications (503) and writes out every one it already acknowledged before exiting; a second signal abandons them, and any acknowledged notification left unwritten, or lost to a closed stdout, is counted on stderr with exit code 1 (previously a closed stdout exited 0).
+- `teams listen` limits bodies to 1 MiB (413), allows 10 seconds for headers and for the body (408), and serves at most 64 connections at once.
+- `teams listen` no longer prints `clientState`.
 - The default redirect URI is now `http://localhost/callback` on a free port instead of `http://localhost:8400/callback`, so a busy port 8400 no longer blocks login. App registrations with `http://localhost:8400/callback` keep working because the port is ignored.
 - Updated Rust dependencies (`tokio` 1.54.1, `serde_json` 1.0.154, `uuid` 1.28.0, `webbrowser` 1.2.5) and the CI and release workflows' `Swatinem/rust-cache` pin to v2.9.3. `rust-version` in `Cargo.toml` is now 1.89, the oldest Rust the dependencies build with; it said 1.75.
 - Updated `sha2` to 0.11.1 (it computes the PKCE code challenge for browser login). The challenge is now unit-tested against the RFC 7636 example, so a hashing or encoding change cannot slip through as failed logins.
 
 ### Fixed
 
+- Log lines on stderr are coloured only when stderr is a terminal and `NO_COLOR` is unset, so `teams listen 2>listen.log` and other redirected logs no longer contain ANSI escape codes. `--no-color` still turns colour off.
+- `teams listen` on a port already in use exits with code 10 (`CONFIG_ERROR`), naming the address and the OS error, instead of reporting an authentication failure (exit code 3).
 - The browser login keeps serving its loopback redirect URI until the callback arrives. It served one connection, so a browser's speculative connection or a second request could leave it waiting forever or failing with "Failed to receive auth code from callback". A redirect carrying the identity platform's `error` (a declined consent, say) now fails the login at once with `error` and `error_description` (exit code 3) instead of that generic message, requests to other paths or with another `state` are ignored, and the login gives up after 10 minutes with no callback.
 - Updated `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.11 for RUSTSEC-2026-0382 and RUSTSEC-2026-0381, under which certificates issued by distrusted intermediates could still be accepted. The `tokio` update also clears RUSTSEC-2026-0386 (unsound `AsyncFd` constructors).
 
