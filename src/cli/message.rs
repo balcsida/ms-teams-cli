@@ -983,9 +983,10 @@ struct MentionIdentity {
     display_name: String,
 }
 
-/// Resolve each `--mention` value (object ID or UPN) through Graph, require a
-/// canonical id and display name for each, and de-duplicate by object ID
-/// keeping the first occurrence.
+/// Resolve each `--mention` value (object ID or UPN) through Graph and require
+/// a canonical id and display name for each. The result stays in flag order,
+/// duplicates included, so `{@N}` in the body can name the N-th flag;
+/// [`apply_mentions`] treats flags that resolve to one person as one mention.
 async fn resolve_mentions(
     client: &GraphClient,
     mentions: &[String],
@@ -995,7 +996,7 @@ async fn resolve_mentions(
         let user = api::users::get_user(client, value).await?;
         resolved.push(validate_mention_user(&user, value)?);
     }
-    Ok(dedup_mentions(resolved))
+    Ok(resolved)
 }
 
 /// A mention needs both the canonical object ID (for the JSON identity) and
@@ -1016,83 +1017,206 @@ fn validate_mention_user(user: &User, requested: &str) -> Result<MentionIdentity
 
 /// Two different inputs (say, a UPN and an object ID) can resolve to the same
 /// person; one mention per canonical object ID, first flag wins.
-fn dedup_mentions(identities: Vec<MentionIdentity>) -> Vec<MentionIdentity> {
+fn dedup_mentions(identities: &[MentionIdentity]) -> Vec<&MentionIdentity> {
     let mut seen = std::collections::HashSet::new();
     identities
-        .into_iter()
-        .filter(|identity| seen.insert(identity.id.clone()))
+        .iter()
+        .filter(|identity| seen.insert(identity.id.as_str()))
         .collect()
 }
 
-/// The `<at id="N">Display Name</at>` prefix, in flag order, with IDs
-/// assigned contiguously from zero. Display names are HTML-escaped here but
-/// stored unescaped in the JSON `mentions` array.
-fn mention_html_prefix(identities: &[MentionIdentity]) -> String {
-    identities
-        .iter()
-        .enumerate()
-        .map(|(i, identity)| {
-            format!(
-                r#"<at id="{}">{}</at>"#,
-                i,
-                escape_html_text(&identity.display_name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// A body split on mention placement tokens. `{@N}` places the N-th
+/// `--mention` flag, `{@}` the only one; `{{@N}}` and `{{@}}` are the literal
+/// text `{@N}` and `{@}`, and are already unescaped in `Text`.
+#[derive(Debug, PartialEq)]
+enum BodyPart<'a> {
+    Text(String),
+    Mention(&'a str),
+}
+
+fn split_mention_tokens(body: &str) -> Vec<BodyPart<'_>> {
+    /// Length of the `{@digits}` token at the start of `s`, if there is one.
+    fn token_len(s: &str) -> Option<usize> {
+        let digits = s.strip_prefix("{@")?;
+        let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+        digits[n..].starts_with('}').then_some(n + 3)
+    }
+
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find('{') {
+        text.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        if let Some(inner) = rest.strip_prefix('{') {
+            if let Some(len) = token_len(inner).filter(|&len| inner[len..].starts_with('}')) {
+                text.push_str(&inner[..len]);
+                rest = &inner[len + 1..];
+                continue;
+            }
+        }
+        if let Some(len) = token_len(rest) {
+            parts.push(BodyPart::Text(std::mem::take(&mut text)));
+            parts.push(BodyPart::Mention(&rest[..len]));
+            rest = &rest[len..];
+            continue;
+        }
+        text.push('{');
+        rest = &rest[1..];
+    }
+    text.push_str(rest);
+    parts.push(BodyPart::Text(text));
+    parts
+}
+
+/// The flag index a token names: `{@N}` is N, `{@}` the only flag.
+fn mention_flag(token: &str, flags: usize) -> Result<usize> {
+    let digits = &token[2..token.len() - 1];
+    if digits.is_empty() {
+        return if flags == 1 {
+            Ok(0)
+        } else {
+            Err(TeamsError::InvalidInput(format!(
+                "{{@}} is only for a single --mention; with {flags}, write {{@0}} to {{@{}}}",
+                flags - 1
+            )))
+        };
+    }
+    match digits.parse::<usize>() {
+        Ok(index) if index < flags => Ok(index),
+        _ => Err(TeamsError::InvalidInput(format!(
+            "{token} has no matching --mention: there {} {flags}, numbered from {{@0}}",
+            if flags == 1 { "is" } else { "are" }
+        ))),
+    }
+}
+
+fn mention_element(id: usize, identity: &MentionIdentity) -> String {
+    format!(
+        r#"<at id="{id}">{}</at>"#,
+        escape_html_text(&identity.display_name)
+    )
+}
+
+/// The JSON half of a mention. Graph pairs it with the body's `<at id="N">`
+/// element by id, so `id` must match that element; the display name is
+/// stored unescaped.
+fn mention_entry(id: usize, identity: &MentionIdentity) -> ChatMessageMention {
+    ChatMessageMention {
+        id: id as i32,
+        mention_text: identity.display_name.clone(),
+        mentioned: ChatMessageMentioned {
+            user: Some(ChatMessageUser {
+                id: Some(identity.id.clone()),
+                display_name: Some(identity.display_name.clone()),
+                user_identity_type: Some("aadUser".to_string()),
+            }),
+            ..Default::default()
+        },
+    }
 }
 
 /// Synchronize the request's body and `mentions` array so each `<at id="N">`
 /// element has a matching entry — both halves are required for Graph to keep
 /// the mention. A plain-text body is safely promoted to HTML (escaped, line
-/// breaks preserved as `<br>`); an explicit HTML body is kept as supplied,
-/// with only the mention prefix prepended.
+/// breaks preserved as `<br>`); an explicit HTML body is kept as supplied.
+///
+/// `identities` are the `--mention` flags in order. Where the body has
+/// `{@N}` tokens, each one becomes an `<at>` element for flag N, numbered in
+/// order of appearance, so a person placed twice gets two elements and two
+/// entries. Every person must be placed; flags that resolve to the same
+/// person count as one. Without tokens, each person is prepended once, in
+/// flag order. `{{@N}}` is always the literal `{@N}`.
 fn apply_mentions(req: &mut SendMessageRequest, identities: &[MentionIdentity]) -> Result<()> {
+    let body = req.body.content.take();
+    let parts = split_mention_tokens(body.as_deref().unwrap_or_default());
+    let tokens: Vec<&str> = parts
+        .iter()
+        .filter_map(|part| match part {
+            BodyPart::Mention(token) => Some(*token),
+            BodyPart::Text(_) => None,
+        })
+        .collect();
+
     if identities.is_empty() {
+        if let Some(token) = tokens.first() {
+            return Err(TeamsError::InvalidInput(format!(
+                "{token} places a mention, but no --mention was given; \
+                 write {{{token}}} for the literal text"
+            )));
+        }
+        let literal = match parts.into_iter().next() {
+            Some(BodyPart::Text(text)) => text,
+            _ => String::new(),
+        };
+        req.body.content = body.is_some().then_some(literal);
         return Ok(());
     }
+
     let content_type = req.body.content_type.as_deref().unwrap_or_default();
     if !matches!(content_type, "text" | "html") {
         return Err(TeamsError::InvalidInput(format!(
             "--mention requires a text or html body, not '{content_type}'"
         )));
     }
-
-    let prefix = mention_html_prefix(identities);
-    let existing = req.body.content.take().unwrap_or_default();
     let promoted = content_type == "text";
     if promoted {
         req.body.content_type = Some("html".to_string());
     }
-    req.body.content = Some(if existing.is_empty() {
-        prefix
-    } else {
-        format!(
-            "{prefix} {}",
-            if promoted {
-                escape_body_text(&existing)
-            } else {
-                existing
-            }
-        )
-    });
+    let text = |t: &str| {
+        if promoted {
+            escape_body_text(t)
+        } else {
+            t.to_string()
+        }
+    };
 
-    req.mentions = Some(
-        identities
+    let mut placed: Vec<&MentionIdentity> = Vec::new();
+    let mut content = String::new();
+    if tokens.is_empty() {
+        placed = dedup_mentions(identities);
+        let prefix: Vec<String> = placed
             .iter()
             .enumerate()
-            .map(|(i, identity)| ChatMessageMention {
-                id: i as i32,
-                mention_text: identity.display_name.clone(),
-                mentioned: ChatMessageMentioned {
-                    user: Some(ChatMessageUser {
-                        id: Some(identity.id.clone()),
-                        display_name: Some(identity.display_name.clone()),
-                        user_identity_type: Some("aadUser".to_string()),
-                    }),
-                    ..Default::default()
-                },
-            })
+            .map(|(i, identity)| mention_element(i, identity))
+            .collect();
+        content = prefix.join(" ");
+        let rest = match &parts[..] {
+            [BodyPart::Text(t)] => text(t),
+            _ => unreachable!("a body without tokens is one text part"),
+        };
+        if !rest.is_empty() {
+            content.push(' ');
+            content.push_str(&rest);
+        }
+    } else {
+        for part in &parts {
+            match part {
+                BodyPart::Text(t) => content.push_str(&text(t)),
+                BodyPart::Mention(token) => {
+                    let identity = &identities[mention_flag(token, identities.len())?];
+                    content.push_str(&mention_element(placed.len(), identity));
+                    placed.push(identity);
+                }
+            }
+        }
+        for (flag, identity) in identities.iter().enumerate() {
+            if !placed.iter().any(|p| p.id == identity.id) {
+                return Err(TeamsError::InvalidInput(format!(
+                    "--mention {} is not placed in the body: add {{@{flag}}} where it \
+                     goes, or remove the flag",
+                    identity.display_name
+                )));
+            }
+        }
+    }
+
+    req.body.content = Some(content);
+    req.mentions = Some(
+        placed
+            .iter()
+            .enumerate()
+            .map(|(i, identity)| mention_entry(i, identity))
             .collect(),
     );
     Ok(())
@@ -1371,11 +1495,12 @@ mod tests {
 
     #[test]
     fn duplicate_object_ids_collapse_to_one_mention() {
-        let deduped = dedup_mentions(vec![
+        let flags = [
             identity("same-oid", "First Name"),
             identity("other-oid", "Other Person"),
             identity("same-oid", "Second Name"),
-        ]);
+        ];
+        let deduped = dedup_mentions(&flags);
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].display_name, "First Name");
         assert_eq!(deduped[1].display_name, "Other Person");
@@ -1562,6 +1687,313 @@ mod tests {
         assert!(matches!(err, TeamsError::InvalidInput(_)), "{err:?}");
     }
 
+    fn text_request(body: &str) -> SendMessageRequest {
+        let mut req = html_request(body);
+        req.body.content_type = Some("text".into());
+        req
+    }
+
+    fn mention_user_ids(req: &SendMessageRequest) -> Vec<(i32, String)> {
+        req.mentions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let user = m.mentioned.user.as_ref().unwrap();
+                (m.id, user.id.clone().unwrap())
+            })
+            .collect()
+    }
+
+    fn placement_error(body: &str, content_type: &str, identities: &[MentionIdentity]) -> String {
+        let err = build_send_request_with_mentions(body.into(), content_type, None, identities)
+            .unwrap_err();
+        assert!(matches!(err, TeamsError::InvalidInput(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 2);
+        err.to_string()
+    }
+
+    /// `{@0}` places the first mention where it stands in a text body; the
+    /// text is escaped and promoted to HTML as it is without tokens.
+    #[test]
+    fn token_places_the_mention_inside_a_text_body() {
+        let mut req = text_request("Hey {@0}, could you review this?\nThanks & bye");
+        apply_mentions(&mut req, &[identity("oid-1", "Sophie Daniels")]).unwrap();
+
+        assert_eq!(req.body.content_type.as_deref(), Some("html"));
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(
+                r#"Hey <at id="0">Sophie Daniels</at>, could you review this?<br>Thanks &amp; bye"#
+            )
+        );
+        assert_eq!(mention_user_ids(&req), [(0, "oid-1".to_string())]);
+    }
+
+    #[test]
+    fn token_places_the_mention_inside_an_html_body() {
+        let mut req = html_request("<p>Hey {@0}, <b>look</b> &amp; reply</p>");
+        apply_mentions(&mut req, &[identity("oid-1", "Sophie")]).unwrap();
+
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<p>Hey <at id="0">Sophie</at>, <b>look</b> &amp; reply</p>"#)
+        );
+        assert_eq!(mention_user_ids(&req), [(0, "oid-1".to_string())]);
+    }
+
+    /// Ids follow the order of appearance in the body, not the flag order.
+    #[test]
+    fn tokens_take_ids_in_body_order() {
+        let mut req = text_request("{@1} then {@0}");
+        apply_mentions(
+            &mut req,
+            &[identity("oid-a", "Ann"), identity("oid-b", "Bob")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<at id="0">Bob</at> then <at id="1">Ann</at>"#)
+        );
+        assert_eq!(
+            mention_user_ids(&req),
+            [(0, "oid-b".to_string()), (1, "oid-a".to_string())]
+        );
+    }
+
+    #[test]
+    fn bare_token_is_shorthand_for_the_only_mention() {
+        let mut req = text_request("Hey {@}!");
+        apply_mentions(&mut req, &[identity("oid-1", "Sophie")]).unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"Hey <at id="0">Sophie</at>!"#)
+        );
+
+        let err = placement_error(
+            "Hey {@}!",
+            "text",
+            &[identity("oid-a", "Ann"), identity("oid-b", "Bob")],
+        );
+        assert!(err.contains("{@}"), "{err}");
+    }
+
+    /// Graph matches `<at id>` elements to `mentions[]` entries one to one, so
+    /// a mention placed twice is two elements with two entries.
+    #[test]
+    fn repeated_token_gets_a_distinct_id_each_time() {
+        let mut req = text_request("{@0}, {@1} and {@0} again");
+        apply_mentions(
+            &mut req,
+            &[identity("oid-a", "Ann"), identity("oid-b", "Bob")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<at id="0">Ann</at>, <at id="1">Bob</at> and <at id="2">Ann</at> again"#)
+        );
+        assert_eq!(
+            mention_user_ids(&req),
+            [
+                (0, "oid-a".to_string()),
+                (1, "oid-b".to_string()),
+                (2, "oid-a".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn token_past_the_last_mention_is_invalid_input() {
+        let err = placement_error("Hey {@1}", "text", &[identity("oid-1", "Sophie")]);
+        assert!(err.contains("{@1}"), "{err}");
+
+        let err = placement_error(
+            "Hey {@99999999999999999999999}",
+            "text",
+            &[identity("oid-1", "Sophie")],
+        );
+        assert!(err.contains("--mention"), "{err}");
+    }
+
+    /// Once tokens place mentions, one left out would silently vanish.
+    #[test]
+    fn unplaced_mention_is_invalid_input() {
+        let err = placement_error(
+            "Hey {@0}",
+            "text",
+            &[identity("oid-a", "Ann"), identity("oid-b", "Bob")],
+        );
+        assert!(err.contains("{@1}") && err.contains("Bob"), "{err}");
+    }
+
+    #[test]
+    fn token_without_any_mention_is_invalid_input() {
+        let err = placement_error("Hey {@0}", "text", &[]);
+        assert!(err.contains("--mention"), "{err}");
+        let err = placement_error("<p>Hey {@}</p>", "html", &[]);
+        assert!(err.contains("--mention"), "{err}");
+    }
+
+    /// `{{@N}}` is the literal text `{@N}`, with or without mentions.
+    #[test]
+    fn doubled_braces_escape_a_literal_token() {
+        let mut req = text_request("{@0}: write {{@0}} or {{@}}");
+        apply_mentions(&mut req, &[identity("oid-1", "Sophie")]).unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<at id="0">Sophie</at>: write {@0} or {@}"#)
+        );
+
+        // Without tokens the mention is prepended, and the escape still reads
+        // as the literal.
+        let mut req = text_request("type {{@0}}");
+        apply_mentions(&mut req, &[identity("oid-1", "Sophie")]).unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<at id="0">Sophie</at> type {@0}"#)
+        );
+
+        let req =
+            build_send_request_with_mentions("type {{@0}}".into(), "text", None, &[]).unwrap();
+        assert_eq!(req.body.content_type.as_deref(), Some("text"));
+        assert_eq!(req.body.content.as_deref(), Some("type {@0}"));
+        assert!(req.mentions.is_none());
+    }
+
+    /// Tokens are read left to right: a doubled brace is consumed as the
+    /// escape before a token can start inside it.
+    #[test]
+    fn token_scanner_edge_cases() {
+        use BodyPart::{Mention, Text};
+        let t = |s: &str| Text(s.to_string());
+        for (body, parts) in [
+            ("{{@0}}", vec![t("{@0}")]),
+            ("{{{@0}}}", vec![t("{{@0}}")]),
+            ("{@0}}", vec![t(""), Mention("{@0}"), t("}")]),
+            ("{{@0}", vec![t("{"), Mention("{@0}"), t("")]),
+            ("é{@12}日本", vec![t("é"), Mention("{@12}"), t("日本")]),
+            (
+                "{@}{@}",
+                vec![t(""), Mention("{@}"), t(""), Mention("{@}"), t("")],
+            ),
+            ("tail {@", vec![t("tail {@")]),
+        ] {
+            assert_eq!(split_mention_tokens(body), parts, "{body}");
+        }
+        // A leading zero still names the flag by number.
+        assert_eq!(mention_flag("{@00}", 1).unwrap(), 0);
+    }
+
+    /// Braces that are not a token are left alone.
+    #[test]
+    fn other_braces_are_not_tokens() {
+        let body = "{@x} {0} {@ 0} {{@x}} @0 {@";
+        let req = build_send_request_with_mentions(body.into(), "text", None, &[]).unwrap();
+        assert_eq!(req.body.content.as_deref(), Some(body));
+    }
+
+    /// The raw-markup check runs on the body as supplied, before tokens are
+    /// replaced with the `<at>` elements the CLI builds.
+    #[test]
+    fn raw_at_markup_is_rejected_alongside_tokens() {
+        let err = placement_error(
+            r#"<p><at id="0">Sophie</at> {@0}</p>"#,
+            "html",
+            &[identity("oid-1", "Sophie")],
+        );
+        assert!(err.contains("raw <at> markup"), "{err}");
+
+        // The <at> the CLI substitutes is not mistaken for raw markup.
+        let req = build_send_request_with_mentions(
+            "<p>{@0}</p>".into(),
+            "html",
+            None,
+            &[identity("oid-1", "Sophie")],
+        )
+        .unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<p><at id="0">Sophie</at></p>"#)
+        );
+    }
+
+    #[test]
+    fn placed_display_names_are_escaped_in_html_only() {
+        let mut req = text_request("cc {@0}");
+        apply_mentions(&mut req, &[identity("oid-1", "R&D <Lead>")]).unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"cc <at id="0">R&amp;D &lt;Lead&gt;</at>"#)
+        );
+        let mention = &req.mentions.as_ref().unwrap()[0];
+        assert_eq!(mention.mention_text, "R&D <Lead>");
+        let user = mention.mentioned.user.as_ref().unwrap();
+        assert_eq!(user.display_name.as_deref(), Some("R&D <Lead>"));
+    }
+
+    /// `{@N}` always names the N-th `--mention` flag. Two flags that resolve
+    /// to the same person (a UPN and an object ID, say) are one person:
+    /// placing either one counts for both, and without tokens the person is
+    /// prepended once, as before.
+    #[test]
+    fn tokens_index_flags_and_duplicate_people_count_once() {
+        let flags = [
+            identity("oid-a", "Ann (by UPN)"),
+            identity("oid-b", "Bob"),
+            identity("oid-a", "Ann (by id)"),
+        ];
+
+        let mut req = text_request("{@2} and {@1}");
+        apply_mentions(&mut req, &flags).unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<at id="0">Ann (by id)</at> and <at id="1">Bob</at>"#)
+        );
+        assert_eq!(
+            mention_user_ids(&req),
+            [(0, "oid-a".to_string()), (1, "oid-b".to_string())]
+        );
+
+        // Ann is never placed under either flag.
+        let err = placement_error("only {@1}", "text", &flags);
+        assert!(err.contains("{@0}"), "{err}");
+
+        let mut req = text_request("hi");
+        apply_mentions(&mut req, &flags).unwrap();
+        assert_eq!(
+            req.body.content.as_deref(),
+            Some(r#"<at id="0">Ann (by UPN)</at> <at id="1">Bob</at> hi"#)
+        );
+        assert_eq!(
+            mention_user_ids(&req),
+            [(0, "oid-a".to_string()), (1, "oid-b".to_string())]
+        );
+    }
+
+    /// A card promotes a text body to `<p>`-wrapped HTML before the mentions
+    /// are applied; a token inside it still lands in place, escaped once.
+    #[test]
+    fn token_and_card_compose() {
+        let dir = std::env::temp_dir().join("teams-cli-card-token");
+        std::fs::create_dir_all(&dir).unwrap();
+        let card = write_card(&dir);
+
+        let req = build_send_request_with_mentions(
+            "a < b, {@0}".into(),
+            "text",
+            Some(&card),
+            &[identity("oid-1", "Sophie")],
+        )
+        .unwrap();
+        let body = req.body.content.unwrap();
+        assert!(
+            body.starts_with(r#"<p>a &lt; b, <at id="0">Sophie</at></p><attachment"#),
+            "{body}"
+        );
+    }
+
     /// A resolved user without an object ID or display name cannot be turned
     /// into a mention, so the command fails before posting anything.
     #[test]
@@ -1597,7 +2029,7 @@ mod tests {
     /// de-duplication — are covered by the tests above.
     #[test]
     fn resolved_identities_flow_through_validation_and_dedup() {
-        let resolved = dedup_mentions(vec![
+        let resolved = [
             validate_mention_user(
                 &serde_json::from_value::<User>(serde_json::json!({
                     "id": "oid-a",
@@ -1616,8 +2048,11 @@ mod tests {
                 "32cbca05-dc05-454f-b0f3-072f331d4c97",
             )
             .unwrap(),
-        ]);
-        assert_eq!(resolved, vec![identity("oid-a", "Sophie Daniels")]);
+        ];
+        assert_eq!(
+            dedup_mentions(&resolved),
+            vec![&identity("oid-a", "Sophie Daniels")]
+        );
     }
 
     #[test]
