@@ -183,7 +183,7 @@ teams message attachments download (--team TEAM_ID --channel CHANNEL_ID [--reply
 teams message attachments delete (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) [--index N] --yes
 teams message reply --team TEAM_ID --channel CHANNEL_ID --message-id MESSAGE_ID [--body TEXT | --stdin] [--content-type text|html] [--image PATH]... [--attach PATH]... [--mention USER]...
 teams message reply --team TEAM_ID --channel CHANNEL_ID --message MESSAGE_ID --body TEXT
-teams message update (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) (--body TEXT | --stdin) [--content-type text|html]
+teams message update (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) (--body TEXT | --stdin) [--content-type text|html] [--mention USER]...
 teams message delete (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) --yes
 teams message undelete (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID)
 teams message react (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) --message-id MESSAGE_ID (REACTION | --reaction REACTION)
@@ -238,7 +238,7 @@ follows the complete replies collection.
 .PP
 .B --mention USER
 (repeatable) tags a person as a real Teams @mention in a chat send, channel
-send, or channel reply;
+send, channel reply, or edit;
 USER may be an Entra object ID or UPN, and the display name is resolved
 through Microsoft Graph. Graph requires an HTML body plus a synchronized
 .B mentions
@@ -246,6 +246,30 @@ array, so the CLI builds both: a plain-text body is converted to HTML (escaped,
 line breaks preserved), the <at> elements are prepended to the body in flag
 order, and a mention by itself counts as a body. Raw <at> markup typed into an
 HTML body is rejected before anything is sent.
+.PP
+To place a mention inside the body, write
+.B {@N}
+where it goes, N being the 0-based position of the
+.B --mention
+flag;
+.B {@}
+means
+.B {@0}
+when there is one. A person placed twice gets two <at> elements. With tokens,
+every
+.B --mention
+must be placed and every token must match one, or the command exits with code
+2. Write
+.B {{@0}}
+for the literal text {@0}, with or without
+.B --mention.
+A body with no {@N} or {@} tokens is sent as before.
+.PP
+.B message update --mention USER
+sends the body and the mentions array together, so an edit can add or keep a
+mention. The edit replaces the body: repeat
+.B --mention
+for each mention that should stay.
 .PP
 .B --subject TEXT
 sets the subject line on a channel root message, the bold title Teams shows

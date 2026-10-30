@@ -55,10 +55,12 @@ teams message send --team <team-id> --channel <channel-id> --subject "Release" -
 teams message reply --team <team-id> --channel <channel-id> --message-id <message-id> --body "Thanks"
 teams message send --chat <chat-id> --quote <message-id> --body "Yes, that works"
 teams message send --chat <chat-id> --mention <user-email> --body "Can you review?"
+teams message send --chat <chat-id> --mention <user-email> --body "Hey {@0}, can you review?"
 teams message send --chat <chat-id> --content-type html --body "<b>Done</b>"
 teams message send --chat <chat-id> --stdin
 teams message update --chat <chat-id> <message-id> --body "Corrected text"
 teams message update --team <team-id> --channel <channel-id> --reply <reply-id> <message-id> --body "Corrected text"
+teams message update --chat <chat-id> <message-id> --mention <user-email> --body "Hey {@0}, corrected text"
 teams message react --chat <chat-id> --message-id <message-id> like
 teams message react --team <team-id> --channel <channel-id> --reply <reply-id> --message-id <message-id> like
 teams message unreact --chat <chat-id> --message-id <message-id> like
@@ -68,6 +70,8 @@ teams message unpin --team <team-id> --channel <channel-id> <pinned-message-id>
 
 - Content is `text` by default. `--content-type html` sends HTML; there is no markdown option. Use `--stdin` for long or multi-line bodies.
 - `--mention` takes an Entra object id or UPN and builds a real @mention. Do not type raw `<at>` markup.
+- Mentions are prepended unless the body places them: `{@0}` is the first `--mention`, `{@1}` the second, `{@}` the only one. Place every `--mention` once you use tokens. `{{@0}}` is the literal text.
+- `update` replaces the whole body. Pass `--mention` again for every mention the edited message should keep.
 - `--subject` works on channel root messages only. `--quote` works in chats only.
 - Replies exist for channel threads. In a chat, send a normal message or use `--quote`.
 - A send that fails with exit 7 or 8 may still have posted. List recent messages before re-sending.
