@@ -89,6 +89,9 @@ pub enum MessageCommand {
         /// Channel ID
         #[arg(long)]
         channel: String,
+        /// Reply ID, to target a reply in a channel thread (MESSAGE_ID is then the parent post)
+        #[arg(long)]
+        reply: Option<String>,
         /// Message ID
         #[arg(required_unless_present = "message", conflicts_with = "message")]
         message_id: Option<String>,
@@ -141,7 +144,7 @@ pub enum MessageCommand {
     },
     /// Add a reaction to a channel or chat message
     #[command(
-        override_usage = "teams message react (--team <TEAM> --channel <CHANNEL> | --chat <CHAT>) --message-id <MESSAGE_ID> <REACTION>"
+        override_usage = "teams message react (--team <TEAM> --channel <CHANNEL> [--reply <REPLY>] | --chat <CHAT>) --message-id <MESSAGE_ID> <REACTION>"
     )]
     React {
         /// Team ID (for channel messages)
@@ -153,6 +156,9 @@ pub enum MessageCommand {
         /// Chat ID (for chat messages)
         #[arg(long, conflicts_with_all = ["team", "channel"])]
         chat: Option<String>,
+        /// Reply ID, to target a reply in a channel thread (MESSAGE_ID is then the parent post)
+        #[arg(long, requires = "team", conflicts_with = "chat")]
+        reply: Option<String>,
         /// Message ID
         #[arg(long, visible_alias = "message")]
         message_id: String,
@@ -173,7 +179,7 @@ pub enum MessageCommand {
     },
     /// Remove a reaction from a channel or chat message
     #[command(
-        override_usage = "teams message unreact (--team <TEAM> --channel <CHANNEL> | --chat <CHAT>) --message-id <MESSAGE_ID> <REACTION>"
+        override_usage = "teams message unreact (--team <TEAM> --channel <CHANNEL> [--reply <REPLY>] | --chat <CHAT>) --message-id <MESSAGE_ID> <REACTION>"
     )]
     Unreact {
         /// Team ID (for channel messages)
@@ -185,6 +191,9 @@ pub enum MessageCommand {
         /// Chat ID (for chat messages)
         #[arg(long, conflicts_with_all = ["team", "channel"])]
         chat: Option<String>,
+        /// Reply ID, to target a reply in a channel thread (MESSAGE_ID is then the parent post)
+        #[arg(long, requires = "team", conflicts_with = "chat")]
+        reply: Option<String>,
         /// Message ID
         #[arg(long, visible_alias = "message")]
         message_id: String,
@@ -308,6 +317,9 @@ pub enum MessageCommand {
         message: Option<String>,
     },
     /// Update a message
+    #[command(
+        override_usage = "teams message update (--team <TEAM> --channel <CHANNEL> [--reply <REPLY>] | --chat <CHAT>) (MESSAGE_ID | --message <MESSAGE>) (--body <BODY> | --stdin) [--content-type <CONTENT_TYPE>]"
+    )]
     Update {
         /// Team ID (for channel messages; requires --channel)
         #[arg(long, requires = "channel", conflicts_with = "chat")]
@@ -318,6 +330,9 @@ pub enum MessageCommand {
         /// Chat ID (for chat messages)
         #[arg(long, required_unless_present = "team")]
         chat: Option<String>,
+        /// Reply ID, to target a reply in a channel thread (MESSAGE_ID is then the parent post)
+        #[arg(long, requires = "team", conflicts_with = "chat")]
+        reply: Option<String>,
         /// Message ID
         #[arg(required_unless_present = "message", conflicts_with = "message")]
         message_id: Option<String>,
@@ -330,8 +345,11 @@ pub enum MessageCommand {
         )]
         message: Option<String>,
         /// New message body
+        #[arg(long, required_unless_present = "stdin", conflicts_with = "stdin")]
+        body: Option<String>,
+        /// Read the new message body from stdin
         #[arg(long)]
-        body: String,
+        stdin: bool,
         /// Content type: text or html
         #[arg(long, default_value = "text")]
         content_type: String,
@@ -496,20 +514,17 @@ pub async fn run(
         MessageCommand::Get {
             team,
             channel,
+            reply,
             message_id,
             message,
             with_attachments,
         } => {
             let start = Instant::now();
             let message_id = resolve_id(message_id, message, "--message or <MESSAGE_ID>")?;
-            let msg =
-                api::messages::get_channel_message(&client, &team, &channel, &message_id).await?;
+            let message_ref =
+                resolve_message_ref(Some(team), Some(channel), None, reply, message_id)?;
+            let msg = api::messages::get_message(&client, &message_ref).await?;
             if with_attachments {
-                let message_ref = api::messages::MessageRef::Channel {
-                    team_id: team,
-                    channel_id: channel,
-                    message_id,
-                };
                 let hosted = api::messages::list_hosted_contents(&client, &message_ref).await?;
                 let items = crate::models::attachment_inventory::build_inventory(&msg, &hosted);
                 let mut value = serde_json::to_value(&msg).map_err(|e| TeamsError::ApiError {
@@ -569,6 +584,7 @@ pub async fn run(
             team,
             channel,
             chat,
+            reply,
             message_id,
             reaction,
             reaction_flag,
@@ -576,21 +592,8 @@ pub async fn run(
             let start = Instant::now();
             auth::require_delegated_token(&client.token, "Reacting to Teams messages")?;
             let reaction = resolve_id(reaction, reaction_flag, "--reaction or <REACTION>")?;
-            let reaction_type = reaction_type_for(&reaction);
-            if let Some(chat_id) = chat {
-                api::messages::set_chat_reaction(&client, &chat_id, &message_id, &reaction_type)
-                    .await?;
-            } else {
-                let (team_id, channel_id) = require_channel(team, channel)?;
-                api::messages::set_reaction(
-                    &client,
-                    &team_id,
-                    &channel_id,
-                    &message_id,
-                    &reaction_type,
-                )
-                .await?;
-            }
+            let target = resolve_message_ref(team, channel, chat, reply, message_id)?;
+            api::messages::set_reaction(&client, &target, &reaction_type_for(&reaction)).await?;
             let result = serde_json::json!({"status": "reaction_set", "reaction": reaction});
             output::print_success(format, &result, start);
             Ok(())
@@ -600,6 +603,7 @@ pub async fn run(
             team,
             channel,
             chat,
+            reply,
             message_id,
             reaction,
             reaction_flag,
@@ -607,21 +611,8 @@ pub async fn run(
             let start = Instant::now();
             auth::require_delegated_token(&client.token, "Removing Teams message reactions")?;
             let reaction = resolve_id(reaction, reaction_flag, "--reaction or <REACTION>")?;
-            let reaction_type = reaction_type_for(&reaction);
-            if let Some(chat_id) = chat {
-                api::messages::unset_chat_reaction(&client, &chat_id, &message_id, &reaction_type)
-                    .await?;
-            } else {
-                let (team_id, channel_id) = require_channel(team, channel)?;
-                api::messages::unset_reaction(
-                    &client,
-                    &team_id,
-                    &channel_id,
-                    &message_id,
-                    &reaction_type,
-                )
-                .await?;
-            }
+            let target = resolve_message_ref(team, channel, chat, reply, message_id)?;
+            api::messages::unset_reaction(&client, &target, &reaction_type_for(&reaction)).await?;
             let result = serde_json::json!({"status": "reaction_removed", "reaction": reaction});
             output::print_success(format, &result, start);
             Ok(())
@@ -709,29 +700,23 @@ pub async fn run(
             team,
             channel,
             chat,
+            reply,
             message_id,
             message,
             body,
+            stdin,
             content_type,
         } => {
             let start = Instant::now();
             auth::require_delegated_token(&client.token, "Updating Teams messages")?;
             let message_id = resolve_id(message_id, message, "--message or <MESSAGE_ID>")?;
-            let req = build_send_request(body, &content_type, None)?;
-            let target = if let Some(chat_id) = chat {
-                api::messages::MessageRef::Chat {
-                    chat_id,
-                    message_id: message_id.clone(),
-                }
-            } else {
-                let (team_id, channel_id) = require_channel(team, channel)?;
-                api::messages::MessageRef::Channel {
-                    team_id,
-                    channel_id,
-                    message_id: message_id.clone(),
-                }
-            };
-            api::messages::update_message(&client, &target, &req).await?;
+            let target = resolve_message_ref(team, channel, chat, reply, message_id)?;
+            let req = build_send_request(resolve_body(body, stdin)?, &content_type, None)?;
+            api::messages::update_message(&client, &target, &req)
+                .await
+                .map_err(|err| {
+                    with_channel_scope_hint(err, &target, client.token.scope.as_deref())
+                })?;
             let msg = read_back(&client, &target, "updated").await;
             output::print_success(format, &msg, start);
             Ok(())
@@ -776,7 +761,7 @@ async fn read_back_at(
     }
 }
 
-/// Channel deletion needs a delegated scope the default login does not
+/// Channel edits and deletions need a delegated scope the default login does not
 /// request, and Graph's 403 does not say so. Name the scope so the likely fix
 /// is obvious. The hint is skipped for chat targets, and when the token
 /// already carries the scope, since the 403 then has another cause (the
@@ -896,19 +881,6 @@ pub(crate) fn resolve_message_ref(
             "Provide either --chat, or both --team and --channel".into(),
         )),
     }
-}
-
-/// Unwraps the team/channel pair for the channel branch. Clap rejects an
-/// incomplete pair during parsing, so this is the residual unwrap rather than
-/// the primary check; the wording matches `message list` for the case where a
-/// future caller reaches it.
-fn require_channel(team: Option<String>, channel: Option<String>) -> Result<(String, String)> {
-    let team_id = team.ok_or_else(|| {
-        TeamsError::InvalidInput("--team and --channel required, or use --chat".into())
-    })?;
-    let channel_id =
-        channel.ok_or_else(|| TeamsError::InvalidInput("--channel is required".into()))?;
-    Ok((team_id, channel_id))
 }
 
 fn message_list_row(message: &ChatMessage) -> Vec<String> {
@@ -1674,12 +1646,6 @@ mod tests {
     }
 
     #[test]
-    fn require_channel_reports_missing_team() {
-        let err = require_channel(None, Some("channel".into())).unwrap_err();
-        assert!(err.to_string().contains("--chat"), "{err}");
-    }
-
-    #[test]
     fn resolve_message_ref_validates_target_combinations() {
         assert!(matches!(
             resolve_message_ref(None, None, Some("19:x".into()), None, "m".into()),
@@ -1706,6 +1672,104 @@ mod tests {
         .is_err());
     }
 
+    /// `update --team T --channel C --reply R P` edits reply R in the thread
+    /// of parent post P: a PATCH to `.../messages/P/replies/R` with the body.
+    #[tokio::test]
+    async fn update_with_reply_patches_the_reply() {
+        use clap::Parser;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "teams",
+            "message",
+            "update",
+            "--team",
+            "T",
+            "--channel",
+            "C",
+            "--reply",
+            "R",
+            "P",
+            "--content-type",
+            "html",
+            "--body",
+            "<p>edited</p>",
+        ])
+        .unwrap();
+        let crate::cli::Commands::Message {
+            command:
+                MessageCommand::Update {
+                    team,
+                    channel,
+                    chat,
+                    reply,
+                    message_id,
+                    message,
+                    body,
+                    stdin,
+                    content_type,
+                },
+        } = cli.command
+        else {
+            panic!("expected message update");
+        };
+        let message_id = resolve_id(message_id, message, "").unwrap();
+        let target = resolve_message_ref(team, channel, chat, reply, message_id).unwrap();
+        let req =
+            build_send_request(resolve_body(body, stdin).unwrap(), &content_type, None).unwrap();
+        let url = target.message_url();
+        assert_eq!(
+            url,
+            "https://graph.microsoft.com/v1.0/teams/T/channels/C/messages/P/replies/R"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/T/channels/C/messages/P/replies/R"))
+            .and(body_json(serde_json::json!({
+                "body": { "contentType": "html", "content": "<p>edited</p>" }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::messages::update_message_at(
+            &read_back::test_client(),
+            &url.replace(api::endpoints::GRAPH_V1, &server.uri()),
+            &req,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `--reply` picks a reply in a channel thread, so with `--chat` every
+    /// command gives the usage error `message delete` gives: exit code 2.
+    #[test]
+    fn reply_with_chat_is_rejected_like_delete() {
+        use clap::Parser;
+        for args in [
+            &["delete", "P", "--yes"][..],
+            &["update", "P", "--body", "x"],
+            &["react", "--message-id", "P", "like"],
+            &["unreact", "--message-id", "P", "like"],
+        ] {
+            let err = crate::cli::Cli::try_parse_from(
+                ["teams", "message"]
+                    .iter()
+                    .chain(args)
+                    .chain(&["--chat", "19:x", "--reply", "R"]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}: {err}"
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
     mod read_back {
         use super::*;
         use crate::auth::token::TokenInfo;
@@ -1714,7 +1778,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        fn test_client() -> GraphClient {
+        pub(super) fn test_client() -> GraphClient {
             GraphClient {
                 http: Client::new(),
                 token: TokenInfo {
@@ -1897,6 +1961,15 @@ mod tests {
         let has_scope = Some("Chat.ReadWrite channelmessage.readwrite User.Read");
         let untouched = with_channel_scope_hint(denied(), &channel, has_scope);
         assert_eq!(untouched.to_string(), "Permission denied: Forbidden");
+
+        let reply = MessageRef::ChannelReply {
+            team_id: "t".into(),
+            channel_id: "c".into(),
+            message_id: "m".into(),
+            reply_id: "r".into(),
+        };
+        let hinted = with_channel_scope_hint(denied(), &reply, default_scopes);
+        assert!(hinted.to_string().contains("ChannelMessage.ReadWrite"));
 
         let untouched = with_channel_scope_hint(denied(), &chat, default_scopes);
         assert_eq!(untouched.to_string(), "Permission denied: Forbidden");

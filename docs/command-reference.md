@@ -108,16 +108,16 @@ teams channel members remove TEAM_ID CHANNEL_ID MEMBER_ID
 ```bash
 teams message send (--team TEAM_ID --channel CHANNEL_ID | --chat CHAT_ID) [--body TEXT | --stdin] [--content-type text|html] [--adaptive-card PATH] [--image PATH]... [--attach PATH]... [--mention USER]... [--subject TEXT] [--quote MESSAGE_ID]...
 teams message list (--team TEAM_ID --channel CHANNEL_ID [--message-id ROOT_MESSAGE_ID] | --chat CHAT_ID)
-teams message get --team TEAM_ID --channel CHANNEL_ID (MESSAGE_ID | --message MESSAGE_ID) [--with-attachments]
+teams message get --team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] (MESSAGE_ID | --message MESSAGE_ID) [--with-attachments]
 teams message attachments list (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID)
 teams message attachments download (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) [--index N] [--dir DIR | --path FILE]
 teams message attachments delete (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) [--index N] --yes
 teams message reply --team TEAM_ID --channel CHANNEL_ID --message-id MESSAGE_ID [--body TEXT | --stdin] [--content-type text|html] [--image PATH]... [--attach PATH]... [--mention USER]...
-teams message update (--team TEAM_ID --channel CHANNEL_ID | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) --body TEXT [--content-type text|html]
+teams message update (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) (--body TEXT | --stdin) [--content-type text|html]
 teams message delete (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID) --yes
 teams message undelete (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) (MESSAGE_ID | --message MESSAGE_ID)
-teams message react (--team TEAM_ID --channel CHANNEL_ID | --chat CHAT_ID) --message-id MESSAGE_ID (REACTION | --reaction REACTION)
-teams message unreact (--team TEAM_ID --channel CHANNEL_ID | --chat CHAT_ID) --message-id MESSAGE_ID (REACTION | --reaction REACTION)
+teams message react (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) --message-id MESSAGE_ID (REACTION | --reaction REACTION)
+teams message unreact (--team TEAM_ID --channel CHANNEL_ID [--reply REPLY_ID] | --chat CHAT_ID) --message-id MESSAGE_ID (REACTION | --reaction REACTION)
 teams message pin --team TEAM_ID --channel CHANNEL_ID (MESSAGE_ID | --message MESSAGE_ID)
 teams message unpin --team TEAM_ID --channel CHANNEL_ID (PINNED_MESSAGE_ID | --pinned-message-id PINNED_MESSAGE_ID)
 ```
@@ -134,7 +134,9 @@ Normal message mutation requires delegated auth. App-only/client-credentials tok
 
 `REACTION` is an emoji character or one of the names the CLI translates for you (`like`, `heart`, `laugh`, `surprised`, `sad`, `angry`, `thumbsup`, `thumbsdown`, `eyes`, `tada`, `rocket`, `fire`). Graph only accepts the emoji character on writes.
 
-`message update` edits your own message in place (Graph lets a delegated caller change any property except `policyViolation`); channel edits need the `ChannelMessage.ReadWrite` delegated scope, chat edits need `Chat.ReadWrite`. Graph returns no content on success, so the command reads the message back and prints it; if that read fails the edit has still been applied and the output is `{"id": ..., "updated": true, "readBackError": ...}`.
+`--reply REPLY_ID` on `get`, `update`, `react`, `unreact`, `delete`, `undelete` and `attachments` targets a reply in a channel thread: `MESSAGE_ID` is then the parent post, and the request goes to `.../messages/MESSAGE_ID/replies/REPLY_ID`. It needs `--team` and `--channel`; with `--chat` it is a usage error (exit code 2). A 404 on a reply names both the parent and the reply ID, since Graph does not say which one is missing.
+
+`message update` edits your own message in place (Graph lets a delegated caller change any property except `policyViolation`); `--stdin` reads the new body from standard input. Channel edits (posts and replies) need the `ChannelMessage.ReadWrite` delegated scope, chat edits need `Chat.ReadWrite`. A 403 on a channel edit names the missing scope, as `message delete` does. Graph returns no content on success, so the command reads the message back and prints it; if that read fails the edit has still been applied and the output is `{"id": ..., "updated": true, "readBackError": ...}`.
 
 `--image` sends a picture the way pasting a screenshot does — the bytes travel inside the message itself (a Graph "hosted content"), so it needs no scopes beyond sending messages. `--attach` uploads the file to real storage first (your OneDrive's `Microsoft Teams Chat Files` for chats, the team's SharePoint library for channels) and links it from the message; that upload needs `Files.ReadWrite` (chats) or `Files.ReadWrite.All` (channels). For chats, the CLI attempts to grant the other members read access with the drive item's `invite` action (no notification email). Recipient discovery also needs `User.Read` and a chat-member read scope such as `Chat.ReadBasic`. Object IDs are used only when the roster confirms the sender and recipient share a tenant; foreign or unknown tenants use email. Lookup failures, members without a usable address, and grant failures warn on stderr with manual-sharing guidance; lookup or sharing failures do not stop upload/send. Both flags repeat for multiple files, and `--body` becomes optional when either is present. Inline images are capped at 3MB each; attachments use Graph's 250MB simple-upload limit.
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `teams message update`, `get`, `react` and `unreact` take `--reply REPLY_ID` to target a reply in a channel thread, as `delete` and `undelete` already did: the message ID is then the parent post and the request goes to `.../messages/{parent}/replies/{reply}`. `--reply` with `--chat` is a usage error (exit code 2).
+- `teams message update --stdin` reads the new body from standard input, like `send` and `reply`.
+
+### Changed
+
+- A 403 from `message update` on a channel post or reply now names the `ChannelMessage.ReadWrite` scope, as `message delete` does. A 404 on a reply names both the parent and the reply ID.
+
 ## v0.11.0 - 2026-10-27
 
 ### Added

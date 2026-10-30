@@ -422,22 +422,25 @@ teams message list --team <team-id> --channel <channel-id>
 teams message list --team <team-id> --channel <channel-id> --message-id <root-message-id> --all-pages
 teams message list --chat <chat-id>
 teams message get --team <team-id> --channel <channel-id> --message <msg-id>
+teams message get --team <team-id> --channel <channel-id> --reply <reply-id> <parent-msg-id>
 teams message attachments delete --chat <chat-id> --message <msg-id> [--index N] --yes
 teams message reply --team <team-id> --channel <channel-id> --message <msg-id> --mention <user-id-or-upn> --body "Thanks!"
 teams message update --team <team-id> --channel <channel-id> --message <msg-id> --body "Corrected"
 teams message update --chat <chat-id> --message <msg-id> --body "Corrected"
+teams message update --team <team-id> --channel <channel-id> --reply <reply-id> <parent-msg-id> --content-type html --body "<p>Corrected</p>"
 teams message delete --chat <chat-id> --message <msg-id> --yes
 teams message delete --team <team-id> --channel <channel-id> --message <msg-id> --yes
 teams message undelete --chat <chat-id> --message <msg-id>
 teams message react --team <team-id> --channel <channel-id> --message <msg-id> --reaction like
 teams message unreact --team <team-id> --channel <channel-id> --message <msg-id> --reaction like
 teams message react --chat <chat-id> --message <msg-id> --reaction eyes
+teams message react --team <team-id> --channel <channel-id> --reply <reply-id> --message <parent-msg-id> --reaction like
 teams message unreact --chat <chat-id> --message <msg-id> --reaction 👀
 teams message pin --team <team-id> --channel <channel-id> --message <msg-id>
 teams message unpin --team <team-id> --channel <channel-id> --pinned-message-id <id>
 ```
 
-`message list --message-id ROOT_MESSAGE_ID` lists the replies under that channel thread root. The global `--page-size` and `--all-pages` options apply to the replies collection.
+`message list --message-id ROOT_MESSAGE_ID` lists the replies under that channel thread root. To act on one reply, `message get`, `update`, `react`, `unreact`, `delete` and `undelete` take `--reply REPLY_ID` with `--team` and `--channel`; the message ID is then the parent post. The global `--page-size` and `--all-pages` options apply to the replies collection.
 
 `message send --chat CHAT_ID --attach FILE` uploads to your OneDrive and attempts
 to share the file with the chat's other members without notification email.

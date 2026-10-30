@@ -1034,6 +1034,27 @@ fn message_delete_and_undelete_accept_chat_and_reply_targets() {
     }
 }
 
+#[test]
+fn message_update_get_and_reactions_accept_reply_targets() {
+    for sub in ["update", "get", "react", "unreact"] {
+        teams()
+            .args(["message", sub, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--reply <REPLY>"));
+    }
+    teams()
+        .args(["message", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(
+                "teams message update (--team <TEAM> --channel <CHANNEL> [--reply <REPLY>] | --chat <CHAT>)",
+            )
+            .and(predicate::str::contains("--stdin")),
+        );
+}
+
 /// Deletion must be confirmed explicitly. Without `--yes` the command is
 /// refused before any token is resolved or request is sent, so the exit code
 /// is 2 (not the auth error a bare environment would otherwise produce) and
