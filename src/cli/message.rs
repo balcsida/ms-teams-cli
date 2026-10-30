@@ -318,7 +318,7 @@ pub enum MessageCommand {
     },
     /// Update a message
     #[command(
-        override_usage = "teams message update (--team <TEAM> --channel <CHANNEL> [--reply <REPLY>] | --chat <CHAT>) (MESSAGE_ID | --message <MESSAGE>) (--body <BODY> | --stdin) [--content-type <CONTENT_TYPE>]"
+        override_usage = "teams message update (--team <TEAM> --channel <CHANNEL> [--reply <REPLY>] | --chat <CHAT>) (MESSAGE_ID | --message <MESSAGE>) (--body <BODY> | --stdin) [--content-type <CONTENT_TYPE>] [--mention <USER>]..."
     )]
     Update {
         /// Team ID (for channel messages; requires --channel)
@@ -353,6 +353,9 @@ pub enum MessageCommand {
         /// Content type: text or html
         #[arg(long, default_value = "text")]
         content_type: String,
+        /// User to @mention (repeatable): an Entra object ID or UPN
+        #[arg(long, value_name = "USER")]
+        mention: Vec<String>,
     },
 }
 
@@ -706,12 +709,17 @@ pub async fn run(
             body,
             stdin,
             content_type,
+            mention,
         } => {
             let start = Instant::now();
             auth::require_delegated_token(&client.token, "Updating Teams messages")?;
             let message_id = resolve_id(message_id, message, "--message or <MESSAGE_ID>")?;
             let target = resolve_message_ref(team, channel, chat, reply, message_id)?;
-            let req = build_send_request(resolve_body(body, stdin)?, &content_type, None)?;
+            // Graph takes the body and the `mentions` array together on the
+            // PATCH, so an edit that keeps or adds a mention re-sends both.
+            let content = resolve_body(body, stdin)?;
+            let identities = resolve_mentions(&client, &mention).await?;
+            let req = build_send_request_with_mentions(content, &content_type, None, &identities)?;
             api::messages::update_message(&client, &target, &req)
                 .await
                 .map_err(|err| {
@@ -2144,6 +2152,7 @@ mod tests {
                     body,
                     stdin,
                     content_type,
+                    mention: _,
                 },
         } = cli.command
         else {

@@ -795,6 +795,56 @@ mod tests {
         .unwrap();
     }
 
+    /// An edit that keeps or adds a mention must PATCH the body and the
+    /// synchronized `mentions` array together, for chats and channels alike.
+    #[tokio::test]
+    async fn update_message_patches_the_body_with_synchronized_mentions() {
+        let expected = serde_json::json!({
+            "body": {
+                "contentType": "html",
+                "content": "Hey <at id=\"0\">Sophie Daniels</at>, edited"
+            },
+            "mentions": [{
+                "id": 0,
+                "mentionText": "Sophie Daniels",
+                "mentioned": {
+                    "user": {
+                        "id": "32cbca05-dc05-454f-b0f3-072f331d4c97",
+                        "displayName": "Sophie Daniels",
+                        "userIdentityType": "aadUser"
+                    }
+                }
+            }]
+        });
+        let req = SendMessageRequest {
+            subject: None,
+            body: ItemBody {
+                content_type: Some("html".into()),
+                content: Some("Hey <at id=\"0\">Sophie Daniels</at>, edited".into()),
+            },
+            attachments: None,
+            hosted_contents: None,
+            mentions: Some(serde_json::from_value(expected["mentions"].clone()).unwrap()),
+        };
+
+        for path_ in [
+            "/chats/19:abc@thread.v2/messages/1700000000000",
+            "/teams/T/channels/C/messages/P/replies/R",
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .and(path(path_))
+                .and(body_json(&expected))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+            update_message_at(&test_client(), &format!("{}{path_}", server.uri()), &req)
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn update_channel_message_accepts_no_content() {
         let server = MockServer::start().await;

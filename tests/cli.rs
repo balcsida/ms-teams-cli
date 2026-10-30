@@ -818,6 +818,55 @@ fn message_send_help_advertises_repeatable_mention_flag() {
 }
 
 #[test]
+fn message_update_help_advertises_repeatable_mention_flag() {
+    teams()
+        .args(["message", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--mention <USER>")
+                .and(predicate::str::contains("(repeatable)"))
+                .and(predicate::str::contains("[--mention <USER>]...")),
+        );
+}
+
+/// Mention placement errors are invalid input (exit code 2), raised before
+/// any request: here a token with no `--mention` to place.
+#[test]
+fn mention_token_without_mention_is_invalid_input() {
+    for args in [
+        vec![
+            "message",
+            "send",
+            "--chat",
+            "19:abc@thread.v2",
+            "--body",
+            "Hey {@0}",
+        ],
+        vec![
+            "message",
+            "update",
+            "--chat",
+            "19:abc@thread.v2",
+            "1",
+            "--body",
+            "Hey {@}",
+        ],
+    ] {
+        teams()
+            .env("TEAMS_CLI_ACCESS_TOKEN", "not-a-real-token")
+            .args(&args)
+            .args(["--output", "json"])
+            .assert()
+            .code(2)
+            .stdout(
+                predicate::str::contains("INVALID_INPUT")
+                    .and(predicate::str::contains("no --mention")),
+            );
+    }
+}
+
+#[test]
 fn message_send_help_advertises_subject_flag() {
     teams()
         .args(["message", "send", "--help"])
